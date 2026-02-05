@@ -163,9 +163,9 @@ async function main() {
       options: {
         allowedTools: ["Read", "Write", "Edit", "Bash", "Grep", "Glob"],
         permissionMode: "bypassPermissions",
+        allowDangerouslySkipPermissions: true, // Required when using bypassPermissions
         cwd: workspace,
         resume: sessionIdToResume,
-        settingSources: ["user"],
       },
     })) {
       // Capture session_id from init message

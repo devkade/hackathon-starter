@@ -33,15 +33,17 @@ export async function GET(
       errorMessage: conversation.errorMessage || undefined,
     };
 
-    // If we have a sessionId and volumeId, read the session file
+    // If we have a sessionId and volumeId, try to read the session file
     if (conversation.sessionId && conversation.volumeId) {
       try {
         const sessionPath = getSessionFilePath(conversation.sessionId);
         const content = await readVolumeFile(conversation.volumeId, sessionPath);
         response.messages = parseSessionJSONL(content);
       } catch (error) {
-        // Session file might not exist yet or be empty
-        console.log("Could not read session file:", error);
+        // Session file doesn't exist yet or can't be read - return empty
+        // The client will show pending messages until real messages arrive
+        console.log("Could not read session file (may not exist yet):", error);
+        response.messages = [];
       }
     }
 

@@ -12,10 +12,18 @@ import { WorkspacePanel } from "@/components/workspace/workspace-panel";
 import type { SessionEntry, ConversationResponse } from "@/lib/types";
 import { PanelRight } from "lucide-react";
 
+// Pending message type for optimistic UI
+interface PendingMessage {
+  id: string;
+  content: string;
+  timestamp: string;
+}
+
 export default function Home() {
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [status, setStatus] = useState<ConversationResponse["status"]>("idle");
-  const [messages, setMessages] = useState<SessionEntry[]>([]);
+  const [serverMessages, setServerMessages] = useState<SessionEntry[]>([]);
+  const [pendingMessages, setPendingMessages] = useState<PendingMessage[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [refreshTrigger, setRefreshTrigger] = useState(0);
@@ -31,7 +39,16 @@ export default function Home() {
         const response = await fetch(`/api/conversations/${conversationId}`);
         if (response.ok) {
           const data: ConversationResponse = await response.json();
-          setMessages(data.messages);
+
+          // Update server messages
+          setServerMessages(data.messages);
+
+          // Clear all pending messages when session completes
+          // (all user messages should now be in the session file)
+          if (data.status === "completed" || data.status === "error") {
+            setPendingMessages([]);
+          }
+
           setStatus(data.status);
           setErrorMessage(data.errorMessage || null);
           setRefreshTrigger((prev) => prev + 1);
@@ -44,15 +61,41 @@ export default function Home() {
     return () => clearInterval(pollInterval);
   }, [conversationId, status]);
 
+  // Compute combined messages: server messages + pending messages as SessionEntry
+  const messages: SessionEntry[] = [
+    ...serverMessages,
+    ...pendingMessages.map((p): SessionEntry => ({
+      type: "user",
+      uuid: p.id,
+      parentUuid: serverMessages.length > 0 ? serverMessages[serverMessages.length - 1].uuid : null,
+      sessionId: "",
+      timestamp: p.timestamp,
+      isSidechain: false,
+      message: {
+        role: "user",
+        content: p.content,
+      },
+    })),
+  ];
+
   // Scroll to bottom when messages change
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }, [serverMessages, pendingMessages]);
 
   const handleSubmit = useCallback(
     async (content: string) => {
       setIsSubmitting(true);
       setErrorMessage(null);
+
+      // Add pending message immediately for optimistic UI
+      const pendingId = `pending-${Date.now()}`;
+      const pendingMsg: PendingMessage = {
+        id: pendingId,
+        content,
+        timestamp: new Date().toISOString(),
+      };
+      setPendingMessages((prev) => [...prev, pendingMsg]);
 
       try {
         const response = await fetch("/api/conversations", {
@@ -72,22 +115,9 @@ export default function Home() {
         const data = await response.json();
         setConversationId(data.conversationId);
         setStatus("running");
-
-        // Optimistically add user message to display
-        const userMessage: SessionEntry = {
-          type: "user",
-          uuid: `temp-${Date.now()}`,
-          parentUuid: null,
-          sessionId: "",
-          timestamp: new Date().toISOString(),
-          isSidechain: false,
-          message: {
-            role: "user",
-            content,
-          },
-        };
-        setMessages((prev) => [...prev, userMessage]);
       } catch (error) {
+        // Remove pending message on error
+        setPendingMessages((prev) => prev.filter((m) => m.id !== pendingId));
         setErrorMessage(error instanceof Error ? error.message : "Unknown error");
       } finally {
         setIsSubmitting(false);

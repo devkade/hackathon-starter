@@ -12,6 +12,18 @@
 
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import * as readline from "readline";
+import * as fs from "fs";
+import * as path from "path";
+
+// Debug logging helper
+function debug(msg: string, data?: any): void {
+  const timestamp = new Date().toISOString();
+  if (data !== undefined) {
+    console.error(`[DEBUG ${timestamp}] ${msg}:`, JSON.stringify(data, null, 2));
+  } else {
+    console.error(`[DEBUG ${timestamp}] ${msg}`);
+  }
+}
 
 // Types for our protocol
 interface ProcessStartCommand {
@@ -52,15 +64,58 @@ function parseContent(msg: SessionMessageCommand): string {
   return "";
 }
 
-async function readLine(rl: readline.Interface): Promise<string | null> {
-  return new Promise((resolve) => {
-    rl.once("line", (line) => {
-      resolve(line);
+/**
+ * Line reader that buffers incoming lines for reliable reading.
+ * This handles the case where stdin is piped quickly and multiple
+ * lines arrive before we're ready to read them.
+ */
+class LineReader {
+  private lines: string[] = [];
+  private resolvers: ((line: string | null) => void)[] = [];
+  private closed = false;
+
+  constructor(rl: readline.Interface) {
+    rl.on("line", (line) => {
+      debug("LineReader received line", { lineLength: line.length, waitingResolvers: this.resolvers.length, bufferedLines: this.lines.length });
+      if (this.resolvers.length > 0) {
+        // Someone is waiting for a line, resolve immediately
+        debug("LineReader: resolving immediately");
+        const resolve = this.resolvers.shift()!;
+        resolve(line);
+      } else {
+        // Buffer the line for later
+        debug("LineReader: buffering line");
+        this.lines.push(line);
+      }
     });
-    rl.once("close", () => {
-      resolve(null);
+
+    rl.on("close", () => {
+      debug("LineReader: stdin closed", { pendingResolvers: this.resolvers.length, bufferedLines: this.lines.length });
+      this.closed = true;
+      // Resolve all pending readers with null
+      while (this.resolvers.length > 0) {
+        const resolve = this.resolvers.shift()!;
+        resolve(null);
+      }
     });
-  });
+  }
+
+  async readLine(): Promise<string | null> {
+    // Check if we have buffered lines
+    if (this.lines.length > 0) {
+      return this.lines.shift()!;
+    }
+
+    // Check if stream is closed
+    if (this.closed) {
+      return null;
+    }
+
+    // Wait for next line
+    return new Promise((resolve) => {
+      this.resolvers.push(resolve);
+    });
+  }
 }
 
 async function callCallback(status: "completed" | "error", sessionId?: string, errorMessage?: string) {
@@ -93,15 +148,62 @@ async function main() {
   const workspace = process.env.WORKSPACE_DIR || process.cwd();
   const resumeSessionId = process.env.RESUME_SESSION_ID || undefined;
 
+  // Debug: Log startup info
+  debug("Agent starting");
+  debug("Environment", {
+    workspace,
+    resumeSessionId,
+    HOME: process.env.HOME,
+    CALLBACK_URL: process.env.CALLBACK_URL,
+    cwd: process.cwd(),
+  });
+
+  // Debug: Check credentials
+  const credentialsPath = path.join(process.env.HOME || "/home/user", ".claude", ".credentials.json");
+  const credentialsExists = fs.existsSync(credentialsPath);
+  debug("Credentials check", {
+    path: credentialsPath,
+    exists: credentialsExists,
+  });
+
+  if (credentialsExists) {
+    try {
+      const creds = JSON.parse(fs.readFileSync(credentialsPath, "utf-8"));
+      const expiresAt = creds?.claudeAiOauth?.expiresAt;
+      if (expiresAt) {
+        const expires = new Date(expiresAt);
+        debug("Credentials expiry", {
+          expiresAt: expires.toISOString(),
+          isExpired: Date.now() > expiresAt,
+        });
+      }
+    } catch (e) {
+      debug("Failed to parse credentials", { error: String(e) });
+    }
+  }
+
+  // Debug: List ~/.claude directory
+  const claudeDir = path.join(process.env.HOME || "/home/user", ".claude");
+  try {
+    const claudeFiles = fs.readdirSync(claudeDir);
+    debug("~/.claude directory contents", claudeFiles);
+  } catch (e) {
+    debug("Failed to list ~/.claude", { error: String(e) });
+  }
+
   const rl = readline.createInterface({
     input: process.stdin,
-    output: process.stdout,
     terminal: false,
   });
 
+  const reader = new LineReader(rl);
+  debug("LineReader initialized, waiting for stdin...");
+
   try {
     // Wait for process_start
-    const startLine = await readLine(rl);
+    debug("Waiting for process_start...");
+    const startLine = await reader.readLine();
+    debug("Received line", { startLine });
     if (!startLine) {
       emit({ type: "process_error", message: "No input received" });
       return;
@@ -123,13 +225,16 @@ async function main() {
     // Use session_id from message or env
     const sessionIdToResume = startMsg.session_id || resumeSessionId || undefined;
 
+    debug("Emitting process_ready", { sessionIdToResume });
     emit({
       type: "process_ready",
       session_id: sessionIdToResume || "pending",
     });
 
     // Wait for session_message
-    const msgLine = await readLine(rl);
+    debug("Waiting for session_message...");
+    const msgLine = await reader.readLine();
+    debug("Received line", { msgLine });
     if (!msgLine) {
       emit({ type: "process_error", message: "No session_message received" });
       return;
@@ -157,6 +262,12 @@ async function main() {
     let currentSessionId: string | undefined = sessionIdToResume;
     let gotResult = false;
 
+    debug("Starting query()", {
+      prompt: prompt.substring(0, 100) + (prompt.length > 100 ? "..." : ""),
+      workspace,
+      resumeSessionId: sessionIdToResume,
+    });
+
     // Run the agent
     for await (const message of query({
       prompt,
@@ -168,6 +279,9 @@ async function main() {
         resume: sessionIdToResume,
       },
     })) {
+      // Debug: Log each message type from query
+      debug("Query message", { type: message.type, subtype: (message as any).subtype });
+
       // Capture session_id from init message
       if (message.type === "system" && (message as any).subtype === "init") {
         currentSessionId = (message as any).session_id;
